@@ -63,7 +63,7 @@ type LaunchTemplate struct {
 type DefaultProvider struct {
 	sync.Mutex
 	region string
-	ecsapi ecs.Client
+	ecsapi *ecs.Client
 	cache  *cache.Cache
 	cm     *pretty.ChangeMonitor
 
@@ -73,7 +73,7 @@ type DefaultProvider struct {
 	vSwitchProvider       vswitch.Provider
 }
 
-func NewDefaultProvider(ctx context.Context, cache *cache.Cache, region string, ecsapi ecs.Client, imageFamily imagefamily.Resolver,
+func NewDefaultProvider(ctx context.Context, cache *cache.Cache, region string, ecsapi *ecs.Client, imageFamily imagefamily.Resolver,
 	securityGroupProvider securitygroup.Provider, vSwitchProvider vswitch.Provider,
 	caBundle *string, startAsync <-chan struct{}, kubeDNSIP net.IP, clusterEndpoint string) *DefaultProvider {
 	l := &DefaultProvider{
