@@ -19,10 +19,12 @@ package cluster
 import (
 	"context"
 	"encoding/base64"
+	"net/http"
+
 	"github.com/cloudpilot-ai/karpenter-provider-alibabacloud/pkg/apis/v1alpha1"
 	"github.com/samber/lo"
 	corev1 "k8s.io/api/core/v1"
-	"net/http"
+	"sigs.k8s.io/karpenter/pkg/cloudprovider"
 )
 
 const customClusterType = "Custom"
@@ -59,4 +61,8 @@ func (c *Custom) FeatureFlags() FeatureFlags {
 		PodsPerCoreEnabled:           false,
 		SupportsENILimitedPodDensity: false,
 	}
+}
+
+func (c *Custom) DefaultOverhead(_ corev1.ResourceList) cloudprovider.InstanceTypeOverhead {
+	return cloudprovider.InstanceTypeOverhead{}
 }
