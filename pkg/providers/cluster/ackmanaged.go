@@ -23,6 +23,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"math"
 	"net/http"
 	"regexp"
 	"sort"
@@ -34,7 +35,10 @@ import (
 	"github.com/patrickmn/go-cache"
 	"github.com/samber/lo"
 	corev1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/api/resource"
 	"sigs.k8s.io/controller-runtime/pkg/log"
+	"sigs.k8s.io/karpenter/pkg/cloudprovider"
+	"sigs.k8s.io/karpenter/pkg/utils/resources"
 
 	"github.com/cloudpilot-ai/karpenter-provider-alibabacloud/pkg/apis/v1alpha1"
 )
@@ -292,6 +296,57 @@ func (a *ACKManaged) formatTaints(taints []corev1.Taint) string {
 	return strings.Join(lo.Map(taints, func(t corev1.Taint, _ int) string {
 		return t.ToString()
 	}), ",")
+}
+
+func (a *ACKManaged) DefaultOverhead(capacity corev1.ResourceList) cloudprovider.InstanceTypeOverhead {
+	// referring to: https://help.aliyun.com/zh/ack/ack-managed-and-ack-dedicated/user-guide/resource-reservation-policy#0f5ffe176df7q
+	// CPU overhead calculation
+	cpuOverHead := calculateCPUOverhead(capacity.Cpu().MilliValue())
+
+	// TODO: In a real environment, the formula does not produce accurate results,
+	// consistently yielding values that are 200MiB larger than expected.
+	// Memory overhead: min(11*pods + 255, memoryMi*0.25)
+	memoryOverHead := int64(math.Min(float64(11*capacity.Pods().Value()+255), float64(capacity.Memory().Value()/1024*1024)*0.25)) + 200
+
+	return cloudprovider.InstanceTypeOverhead{
+		KubeReserved: corev1.ResourceList{
+			corev1.ResourceCPU:    *resource.NewMilliQuantity(cpuOverHead/2, resource.DecimalSI),
+			corev1.ResourceMemory: *resources.Quantity(fmt.Sprintf("%dMi", memoryOverHead/2)),
+		},
+		SystemReserved: corev1.ResourceList{
+			corev1.ResourceCPU:    *resource.NewMilliQuantity(cpuOverHead/2, resource.DecimalSI),
+			corev1.ResourceMemory: *resources.Quantity(fmt.Sprintf("%dMi", memoryOverHead/2)),
+		},
+	}
+}
+
+// thresholds defines CPU overhead thresholds and their corresponding percentages
+var thresholds = [...]struct {
+	cores    int64
+	overhead float64
+}{
+	{1000, 0.06},
+	{2000, 0.01},
+	{3000, 0.005},
+	{4000, 0.005},
+}
+
+func calculateCPUOverhead(cpuM int64) int64 {
+	var cpuOverHead int64
+
+	// Calculate overhead for each threshold
+	for _, t := range thresholds {
+		if cpuM >= t.cores {
+			cpuOverHead += int64(1000 * t.overhead)
+		}
+	}
+
+	// Additional overhead for CPU > 4 cores (0.25%)
+	if cpuM > 4000 {
+		cpuOverHead += int64(float64(cpuM-4000) * 0.0025)
+	}
+
+	return cpuOverHead
 }
 
 type NodeConfig struct {

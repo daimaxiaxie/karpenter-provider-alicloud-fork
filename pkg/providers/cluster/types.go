@@ -23,6 +23,7 @@ import (
 	ackclient "github.com/alibabacloud-go/cs-20151215/v5/client"
 	"github.com/patrickmn/go-cache"
 	corev1 "k8s.io/api/core/v1"
+	"sigs.k8s.io/karpenter/pkg/cloudprovider"
 
 	"github.com/cloudpilot-ai/karpenter-provider-alibabacloud/pkg/apis/v1alpha1"
 	alicache "github.com/cloudpilot-ai/karpenter-provider-alibabacloud/pkg/cache"
@@ -58,6 +59,7 @@ type Provider interface {
 	LivenessProbe(*http.Request) error
 	GetSupportedImages(string) ([]Image, error)
 	FeatureFlags() FeatureFlags
+	DefaultOverhead(corev1.ResourceList) cloudprovider.InstanceTypeOverhead
 }
 
 func NewClusterProvider(ctx context.Context, ackClient *ackclient.Client, region string) Provider {

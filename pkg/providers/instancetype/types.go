@@ -39,6 +39,11 @@ import (
 	"github.com/cloudpilot-ai/karpenter-provider-alibabacloud/pkg/providers/imagefamily"
 )
 
+const (
+	MemoryAvailable = "memory.available"
+	NodeFSAvailable = "nodefs.available"
+)
+
 var (
 	instanceTypeScheme = regexp.MustCompile(`^ecs\.([a-z]+)(\-[0-9]+tb)?([0-9]+).*`)
 )
@@ -59,55 +64,10 @@ type ZoneData struct {
 	SpotAvailable bool
 }
 
-func calculateResourceOverhead(pods, cpuM, memoryMi int64) corev1.ResourceList {
-	// referring to: https://help.aliyun.com/zh/ack/ack-managed-and-ack-dedicated/user-guide/resource-reservation-policy#0f5ffe176df7q
-	// CPU overhead calculation
-	cpuOverHead := calculateCPUOverhead(cpuM)
-
-	// TODO: In a real environment, the formula does not produce accurate results,
-	// consistently yielding values that are 200MiB larger than expected.
-	// Memory overhead: min(11*pods + 255, memoryMi*0.25)
-	memoryOverHead := int64(math.Min(float64(11*pods+255), float64(memoryMi)*0.25)) + 200
-
-	return corev1.ResourceList{
-		corev1.ResourceCPU:    *resource.NewMilliQuantity(cpuOverHead, resource.DecimalSI),
-		corev1.ResourceMemory: *resources.Quantity(fmt.Sprintf("%dMi", memoryOverHead)),
-	}
-}
-
-// thresholds defines CPU overhead thresholds and their corresponding percentages
-var thresholds = [...]struct {
-	cores    int64
-	overhead float64
-}{
-	{1000, 0.06},
-	{2000, 0.01},
-	{3000, 0.005},
-	{4000, 0.005},
-}
-
-func calculateCPUOverhead(cpuM int64) int64 {
-	var cpuOverHead int64
-
-	// Calculate overhead for each threshold
-	for _, t := range thresholds {
-		if cpuM >= t.cores {
-			cpuOverHead += int64(1000 * t.overhead)
-		}
-	}
-
-	// Additional overhead for CPU > 4 cores (0.25%)
-	if cpuM > 4000 {
-		cpuOverHead += int64(float64(cpuM-4000) * 0.0025)
-	}
-
-	return cpuOverHead
-}
-
 func NewInstanceType(ctx context.Context,
 	info *ecsclient.DescribeInstanceTypesResponseBodyInstanceTypesInstanceType,
 	kc *v1alpha1.KubeletConfiguration, region string, systemDisk *v1alpha1.SystemDisk,
-	offerings cloudprovider.Offerings, clusterCNI string) *cloudprovider.InstanceType {
+	offerings cloudprovider.Offerings, clusterCNI string, cluster cluster.Provider) *cloudprovider.InstanceType {
 	if offerings == nil {
 		return nil
 	}
@@ -117,16 +77,10 @@ func NewInstanceType(ctx context.Context,
 		Requirements: computeRequirements(info, offerings, region),
 		Offerings:    offerings,
 		Capacity:     computeCapacity(ctx, info, kc.MaxPods, kc.PodsPerCore, systemDisk, clusterCNI),
-		Overhead: &cloudprovider.InstanceTypeOverhead{
-			KubeReserved:      corev1.ResourceList{},
-			SystemReserved:    corev1.ResourceList{},
-			EvictionThreshold: corev1.ResourceList{},
-		},
 	}
 
 	// Follow KubeReserved/SystemReserved/EvictionThreshold will be merged, so we can set only one overhead totally
-	it.Overhead.KubeReserved = calculateResourceOverhead(it.Capacity.Pods().Value(),
-		it.Capacity.Cpu().MilliValue(), extractMemory(info).Value()/MiBByteRatio)
+	it.Overhead = computeOverhead(cluster, it.Capacity, kc)
 	if it.Requirements.Compatible(scheduling.NewRequirements(scheduling.NewRequirement(corev1.LabelOSStable, corev1.NodeSelectorOpIn, string(corev1.Windows)))) == nil {
 		it.Capacity[v1alpha1.ResourcePrivateIPv4Address] = *privateIPv4Address(info)
 	}
@@ -352,4 +306,43 @@ func privateIPv4Address(info *ecsclient.DescribeInstanceTypesResponseBodyInstanc
 
 func getInstanceBandwidth(info *ecsclient.DescribeInstanceTypesResponseBodyInstanceTypesInstanceType) int32 {
 	return max(lo.FromPtr(info.InstanceBandwidthRx), lo.FromPtr(info.InstanceBandwidthTx))
+}
+
+func computeOverhead(cluster cluster.Provider, capacity corev1.ResourceList, kubeletConfig *v1alpha1.KubeletConfiguration) *cloudprovider.InstanceTypeOverhead {
+	overhead := &cloudprovider.InstanceTypeOverhead{
+		KubeReserved:   corev1.ResourceList{},
+		SystemReserved: corev1.ResourceList{},
+		// ref: https://github.com/kubernetes/kubernetes/blob/master/pkg/kubelet/eviction/defaults_linux.go
+		EvictionThreshold: corev1.ResourceList{
+			corev1.ResourceMemory:           resource.MustParse("100Mi"),
+			corev1.ResourceEphemeralStorage: computeEvictionSignal(*capacity.StorageEphemeral(), "10%"),
+		},
+	}
+
+	defaultOverhead := cluster.DefaultOverhead(capacity)
+	if defaultOverhead.KubeReserved != nil {
+		overhead.KubeReserved = lo.Assign(overhead.KubeReserved, defaultOverhead.KubeReserved)
+	}
+	if defaultOverhead.SystemReserved != nil {
+		overhead.SystemReserved = lo.Assign(overhead.SystemReserved, defaultOverhead.SystemReserved)
+	}
+	if defaultOverhead.EvictionThreshold != nil {
+		overhead.EvictionThreshold = lo.Assign(overhead.EvictionThreshold, defaultOverhead.EvictionThreshold)
+	}
+
+	overhead.KubeReserved = lo.Assign(overhead.KubeReserved, lo.MapEntries(kubeletConfig.KubeReserved, func(k string, v string) (corev1.ResourceName, resource.Quantity) {
+		return corev1.ResourceName(k), resource.MustParse(v)
+	}))
+	overhead.SystemReserved = lo.Assign(overhead.SystemReserved, lo.MapEntries(kubeletConfig.SystemReserved, func(k string, v string) (corev1.ResourceName, resource.Quantity) {
+		return corev1.ResourceName(k), resource.MustParse(v)
+	}))
+	if kubeletConfig.EvictionHard != nil {
+		if v, ok := kubeletConfig.EvictionHard[MemoryAvailable]; ok {
+			overhead.EvictionThreshold[corev1.ResourceMemory] = computeEvictionSignal(*capacity.Memory(), v)
+		}
+		if v, ok := kubeletConfig.EvictionHard[NodeFSAvailable]; ok {
+			overhead.EvictionThreshold[corev1.ResourceEphemeralStorage] = computeEvictionSignal(*capacity.StorageEphemeral(), v)
+		}
+	}
+	return overhead
 }
